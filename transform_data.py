@@ -1,191 +1,125 @@
-from elasticsearch import Elasticsearch, helpers
-from datetime import datetime, date
-import sys
+from datetime import datetime
+from elasticsearch import Elasticsearch
 
 # === CONFIGURATION ===
 ES_ENDPOINT = "https://my-elasticsearch-project-fb163a.es.asia-south1.gcp.elastic.cloud:443"
 ES_API_KEY = "S1BmR0xwb0JyQkNLQWZtRGJnU2U6R082bzl4UmNVWVl6VmpIY2VRYlNQUQ=="
-
 SOURCE_INDEX = "it_asset"
-TARGET_INDEX = "it_asset_transformed"
+TARGET_INDEX = "it_assets_transformed"
 
-# === CONNECT TO ELASTICSEARCH ===
+# === CONNECT TO ELASTIC ===
 es = Elasticsearch(
     ES_ENDPOINT,
     api_key=ES_API_KEY,
     verify_certs=True
 )
 
+# === CHECK CONNECTION ===
 if not es.ping():
     print("❌ Connection failed! Please check endpoint or API key.")
-    sys.exit(1)
+    exit()
 else:
     print("✅ Connected to Elasticsearch!")
 
+# === 1️⃣ DELETE AND RECREATE TARGET INDEX ===
+try:
+    es.indices.delete(index=TARGET_INDEX)
+    print(f"🗑️ Deleted existing index '{TARGET_INDEX}'")
+except:
+    print(f"ℹ️ Index '{TARGET_INDEX}' doesn't exist, creating new one")
 
-# === HELPER FUNCTIONS ===
-def calculate_system_age(install_date):
-    """Calculate system age (in years) from installation date."""
-    try:
-        if not install_date or install_date == "Unknown":
-            return None
-        install_date = datetime.strptime(install_date, "%Y-%m-%d").date()
-        today = date.today()
-        years = today.year - install_date.year - (
-            (today.month, today.day) < (install_date.month, install_date.day)
-        )
-        return max(0, years)
-    except Exception:
-        return None
+# === 2️⃣ REINDEX DATA TO ANOTHER INDEX ===
+print("📦 Reindexing data ...")
 
+# Check source data first
+source_count = es.count(index=SOURCE_INDEX)["count"]
+print(f"   Source index '{SOURCE_INDEX}' has {source_count} records")
 
-def get_risk_level(status):
-    """Return High if lifecycle status is EOL/EOS, else Low."""
-    if not status:
-        return "Low"
-    status = str(status).strip().upper()
-    return "High" if status in ["EOL", "EOS"] else "Low"
+reindex_body = {
+    "source": {"index": SOURCE_INDEX},
+    "dest": {"index": TARGET_INDEX}
+}
 
+reindex_result = es.reindex(body=reindex_body, wait_for_completion=True)
+print(f"✅ Reindex completed. Copied: {reindex_result.get('total', 0)} records")
 
-def should_delete(doc):
-    """Return True if record should be deleted (missing or Unknown hostname)."""
-    src = doc.get("_source", {})
-    hostname = str(src.get("hostname", "")).strip()
-    return not hostname or hostname.lower() == "unknown"
+# Force refresh and wait a moment
+es.indices.refresh(index=TARGET_INDEX)
+import time
+time.sleep(2)
 
+# Verify target data
+target_count = es.count(index=TARGET_INDEX)["count"]
+print(f"   Target index '{TARGET_INDEX}' now has {target_count} records")
 
-# === MAIN TRANSFORMATION ===
-def transform_and_reindex():
-    print(f"\n🔄 Reindexing data from '{SOURCE_INDEX}' to '{TARGET_INDEX}'...")
-
-    # Create target index (if not exists)
-    if not es.indices.exists(index=TARGET_INDEX):
-        es.indices.create(index=TARGET_INDEX)
-        print(f"✅ Created target index: {TARGET_INDEX}")
-
-    total = 0
-    transformed = 0
-    deleted = 0
-    actions = []
-
-    for doc in helpers.scan(es, index=SOURCE_INDEX, scroll="5m"):
-        total += 1
-
-        if should_delete(doc):
-            deleted += 1
-            continue
-
-        src = doc["_source"].copy()
-        src["risk_level"] = get_risk_level(src.get("operating_system_lifecycle_status"))
-        src["system_age_years"] = calculate_system_age(src.get("operating_system_installation_date"))
-        src["transformation_timestamp"] = datetime.now().isoformat()
-
-        actions.append({
-            "_index": TARGET_INDEX,
-            "_source": src
-        })
-        transformed += 1
-
-    if actions:
-        helpers.bulk(es, actions, chunk_size=500)
-        print(f"✅ Reindexed {transformed} documents to '{TARGET_INDEX}'")
-
-    print(f"🗑️ Skipped {deleted} invalid documents (missing or Unknown hostnames)")
-    print(f"📊 Total processed: {total}")
-
-
-def update_existing_records():
-    """Update existing records in source index using _update_by_query."""
-    print(f"\n🔄 Updating '{SOURCE_INDEX}' records with new fields...")
-
-    update_script = {
-        "script": {
-            "source": """
-                String status = ctx._source.operating_system_lifecycle_status;
-                if (status != null && (status.equalsIgnoreCase('EOL') || status.equalsIgnoreCase('EOS'))) {
-                    ctx._source.risk_level = 'High';
-                } else {
-                    ctx._source.risk_level = 'Low';
-                }
-
-                String dateStr = ctx._source.operating_system_installation_date;
-                if (dateStr != null && !dateStr.equalsIgnoreCase('Unknown')) {
-                    try {
-                        SimpleDateFormat sdf = new SimpleDateFormat('yyyy-MM-dd');
-                        Date inst = sdf.parse(dateStr);
-                        Date now = new Date();
-                        long diff = now.getTime() - inst.getTime();
-                        long years = diff / (365L * 24 * 60 * 60 * 1000);
-                        ctx._source.system_age_years = (int) Math.max(0, years);
-                    } catch (Exception e) {
-                        ctx._source.system_age_years = null;
-                    }
-                }
-
-                ctx._source.last_updated_timestamp = new Date().getTime();
-            """,
-            "lang": "painless"
-        }
+# === 3️⃣ ADD DERIVED FIELDS (risk_level + system_age_years) ===
+# Painless script to calculate risk_level and system_age_years
+update_script = """
+// Add risk_level based on lifecycle status
+if (ctx._source.containsKey('operating_system_lifecycle_status')) {
+    def status = ctx._source.operating_system_lifecycle_status.toLowerCase();
+    if (status == 'eol' || status == 'eos') {
+        ctx._source.risk_level = 'High';
+    } else {
+        ctx._source.risk_level = 'Low';
     }
+}
 
-    try:
-        response = es.update_by_query(
-            index=SOURCE_INDEX,
-            body=update_script,
-            refresh=True,
-            wait_for_completion=True
-        )
-
-        print(f"✅ Updated {response['updated']} documents in '{SOURCE_INDEX}'")
-        if response.get("failures"):
-            print(f"⚠️ {len(response['failures'])} update failures detected.")
-    except Exception as e:
-        print(f"❌ Error updating existing records: {str(e)}")
-
-
-def delete_invalid_records():
-    """Delete records with missing or 'Unknown' hostnames."""
-    print(f"\n🗑️ Deleting records with missing or Unknown hostnames from '{SOURCE_INDEX}'...")
-
-    delete_query = {
-        "query": {
-            "bool": {
-                "should": [
-                    {"bool": {"must_not": {"exists": {"field": "hostname"}}}},
-                    {"term": {"hostname.keyword": ""}},
-                    {"term": {"hostname.keyword": "Unknown"}}
-                ],
-                "minimum_should_match": 1
-            }
+// Add system_age_years based on installation date
+if (ctx._source.containsKey('operating_system_installation_date')) {
+    try {
+        def date_str = ctx._source.operating_system_installation_date;
+        if (date_str != null && date_str.length() >= 4) {
+            def install_year = Integer.parseInt(date_str.substring(0, 4));
+            def current_year = 2025;
+            ctx._source.system_age_years = current_year - install_year;
         }
+    } catch (Exception e) {
+        // ignore invalid dates
     }
+}
+"""
 
-    try:
-        response = es.delete_by_query(
-            index=SOURCE_INDEX,
-            body=delete_query,
-            wait_for_completion=True,
-            refresh=True
-        )
+print("⚙️  Adding derived fields (risk_level, system_age_years) ...")
+update_query = {
+    "script": {"source": update_script, "lang": "painless"},
+    "query": {"match_all": {}}
+}
 
-        print(f"✅ Deleted {response['deleted']} documents with missing/Unknown hostnames.")
-        if response.get("failures"):
-            print(f"⚠️ {len(response['failures'])} documents failed to delete.")
-    except Exception as e:
-        print(f"❌ Error deleting invalid hostname records: {str(e)}")
+es.update_by_query(index=TARGET_INDEX, body=update_query, refresh=True)
+print("✅ Added derived fields successfully!")
 
+# === 4️⃣ DELETE RECORDS WITH UNKNOWN HOSTNAMES ONLY ===
+print("🧹 Deleting records with Unknown hostnames only...")
 
-# === MAIN FUNCTION ===
-def main():
-    print("🚀 Starting Elasticsearch Data Transformation")
-    print("=" * 60)
+# First, let's check what we have before deleting
+count_before = es.count(index=TARGET_INDEX)["count"]
+print(f"   Records before deletion: {count_before}")
 
-    transform_and_reindex()
-    update_existing_records()
-    delete_invalid_records()
+# Delete records where hostname equals "Unknown" 
+delete_query = {
+    "query": {
+        "term": {"hostname.keyword": "Unknown"}
+    }
+}
 
-    print("\n🎯 Transformation completed successfully!")
+result = es.delete_by_query(index=TARGET_INDEX, body=delete_query, refresh=True)
+print(f"✅ Deleted {result['deleted']} records with Unknown hostnames")
+print("ℹ️ Keeping records with Unknown providers (as requested)")
 
+# === 5️⃣ FINAL UPDATE CONFIRMATION ===
+count = es.count(index=TARGET_INDEX)["count"]
+print(f"📊 Transformation complete! Final record count in '{TARGET_INDEX}': {count}")
 
-if __name__ == "__main__":
-    main()
+# === SHOW SAMPLE RECORD ===
+sample = es.search(index=TARGET_INDEX, body={"size": 1})
+if sample['hits']['hits']:
+    record = sample['hits']['hits'][0]['_source']
+    print(f"\n📋 Sample transformed record:")
+    print(f"   • Hostname: {record.get('hostname')}")
+    print(f"   • Provider: {record.get('operating_system_provider')}")
+    print(f"   • Lifecycle Status: {record.get('operating_system_lifecycle_status')}")
+    print(f"   • Risk Level: {record.get('risk_level')}")
+    print(f"   • System Age: {record.get('system_age_years')} years")
+else:
+    print("⚠️ No records found in transformed index!")
