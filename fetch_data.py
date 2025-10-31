@@ -5,7 +5,7 @@ import os
 # === CONFIGURATION ===
 ES_ENDPOINT = "https://my-elasticsearch-project-fb163a.es.asia-south1.gcp.elastic.cloud:443"
 ES_API_KEY = "S1BmR0xwb0JyQkNLQWZtRGJnU2U6R082bzl4UmNVWVl6VmpIY2VRYlNQUQ=="
-OUTPUT_DIR = "elastic_exports"
+OUTPUT_DIR = "elastic_export"
 
 # === CONNECT TO ELASTIC ===
 es = Elasticsearch(
